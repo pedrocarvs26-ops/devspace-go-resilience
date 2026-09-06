@@ -66,23 +66,33 @@ type LoggingConfig struct {
 
 // Config holds all Dev Space Go server configuration.
 type Config struct {
-	Host          string        `json:"host"`
-	Port          int           `json:"port"`
-	AllowedRoots  []string      `json:"allowedRoots"`
-	PublicBaseURL string        `json:"publicBaseUrl"`
-	StateDir      string        `json:"stateDir"`
-	WorktreeRoot  string        `json:"worktreeRoot"`
-	AgentDir      string        `json:"agentDir"`
-	ConfigDir     string        `json:"configDir"`
-	ToolMode      ToolMode      `json:"toolMode"`
-	ToolNaming    ToolNaming    `json:"toolNaming"`
-	Shell         string        `json:"shell"`
-	Lang          string        `json:"lang"`
-	Widgets       WidgetMode    `json:"widgets"`
-	SkillsEnabled bool          `json:"skillsEnabled"`
-	SkillPaths    []string      `json:"skillPaths"`
-	AllowedHosts  []string      `json:"allowedHosts"`
-	Logging       LoggingConfig `json:"logging"`
+	loadError               error
+	CloudflaredTunnelName   string            `json:"cloudflaredTunnelName,omitempty"`
+	TunnelPublicURL         string            `json:"tunnelPublicUrl,omitempty"`
+	HTTPReadTimeout         string            `json:"httpReadTimeout"`
+	HTTPWriteTimeout        string            `json:"httpWriteTimeout"`
+	HTTPIdleTimeout         string            `json:"httpIdleTimeout"`
+	TunnelHeartbeatInterval string            `json:"tunnelHeartbeatInterval"`
+	TunnelReconnectBackoff  string            `json:"tunnelReconnectBackoff"`
+	BashResourceLimit       BashResourceLimit `json:"bashResourceLimit"`
+	BashJobs                BashJobs          `json:"bashJobs"`
+	Host                    string            `json:"host"`
+	Port                    int               `json:"port"`
+	AllowedRoots            []string          `json:"allowedRoots"`
+	PublicBaseURL           string            `json:"publicBaseUrl"`
+	StateDir                string            `json:"stateDir"`
+	WorktreeRoot            string            `json:"worktreeRoot"`
+	AgentDir                string            `json:"agentDir"`
+	ConfigDir               string            `json:"configDir"`
+	ToolMode                ToolMode          `json:"toolMode"`
+	ToolNaming              ToolNaming        `json:"toolNaming"`
+	Shell                   string            `json:"shell"`
+	Lang                    string            `json:"lang"`
+	Widgets                 WidgetMode        `json:"widgets"`
+	SkillsEnabled           bool              `json:"skillsEnabled"`
+	SkillPaths              []string          `json:"skillPaths"`
+	AllowedHosts            []string          `json:"allowedHosts"`
+	Logging                 LoggingConfig     `json:"logging"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
@@ -91,6 +101,9 @@ func DefaultConfig() *Config {
 	exeDir := exeDir()
 
 	return &Config{
+		HTTPReadTimeout: "15s", HTTPWriteTimeout: "0s", HTTPIdleTimeout: "120s",
+		TunnelHeartbeatInterval: "15s", TunnelReconnectBackoff: "1s",
+		BashResourceLimit: DefaultBashResourceLimit(), BashJobs: DefaultBashJobs(),
 		Host:          "127.0.0.1",
 		Port:          7676,
 		AllowedRoots:  []string{},
@@ -212,8 +225,13 @@ func LoadConfig() *Config {
 		var fileConfig Config
 		var raw map[string]json.RawMessage
 		_ = json.Unmarshal(data, &raw)
-		if err := json.Unmarshal(data, &fileConfig); err == nil {
+		decodeErr := json.Unmarshal(data, &fileConfig)
+		if decodeErr != nil {
+			cfg.loadError = fmt.Errorf("invalid config.json: %w", decodeErr)
+		}
+		if decodeErr == nil {
 			// Merge file config (file takes precedence for non-empty values)
+			mergeRuntimeConfig(cfg, raw)
 			if fileConfig.Host != "" {
 				cfg.Host = fileConfig.Host
 			}

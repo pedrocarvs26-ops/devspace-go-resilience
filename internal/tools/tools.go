@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -42,17 +41,6 @@ var unixSkippedDirs = map[string]bool{
 	".npm":      true,
 	".opencode": true,
 	".var":      true,
-}
-
-var configuredShell = "auto"
-
-// SetShell configures the shell used by the bash tool.
-// Accepted values: auto, powershell, cmd, bash, sh.
-func SetShell(shell string) {
-	configuredShell = strings.ToLower(strings.TrimSpace(shell))
-	if configuredShell == "" {
-		configuredShell = "auto"
-	}
 }
 
 // ReadInput represents the input for the read tool.
@@ -580,62 +568,6 @@ func ListDirectory(ctx context.Context, req *mcp.CallToolRequest, input LsInput,
 	}, LsOutput{Result: result}, nil
 }
 
-// BashInput represents the input for the bash tool.
-type BashInput struct {
-	WorkspaceID      string `json:"workspaceId" jsonschema:"Workspace identifier returned by open_workspace."`
-	Command          string `json:"command" jsonschema:"Shell command to run."`
-	WorkingDirectory string `json:"workingDirectory,omitempty" jsonschema:"Optional working directory relative to the workspace root."`
-	Timeout          int    `json:"timeout,omitempty" jsonschema:"Timeout in seconds. Defaults to 30, max 300."`
-}
-
-// BashOutput represents the output for the bash tool.
-type BashOutput struct {
-	Result string `json:"result" jsonschema:"Shell command output."`
-}
-
-// RunBash executes a shell command. Uses PowerShell on Windows, bash on Unix.
-func RunBash(ctx context.Context, req *mcp.CallToolRequest, input BashInput, wsRoot string) (*mcp.CallToolResult, BashOutput, error) {
-	cwd := wsRoot
-	if input.WorkingDirectory != "" {
-		cwd = filepath.Join(wsRoot, input.WorkingDirectory)
-	}
-
-	timeout := 30
-	if input.Timeout > 0 {
-		timeout = input.Timeout
-		if timeout > 300 {
-			timeout = 300
-		}
-	}
-
-	cmdName, cmdArgs := shellCommandForOS(configuredShell, runtime.GOOS, input.Command)
-
-	output, err := runCommand(ctx, cwd, cmdName, cmdArgs, timeout)
-	if err != nil && output == "" {
-		result := &mcp.CallToolResult{}
-		result.SetError(fmt.Errorf("command failed: %v", err))
-		return result, BashOutput{}, nil
-	}
-
-	result := output
-	if err != nil && output != "" {
-		if result != "" {
-			result += "\n"
-		}
-		result += "[stderr] " + err.Error()
-	}
-	if result == "" {
-		result = "(no output)"
-	}
-	result = truncateOutput(result)
-
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{Text: result},
-		},
-	}, BashOutput{Result: result}, nil
-}
-
 func shellCommandForOS(preferredShell, goos, command string) (string, []string) {
 	if goos == "windows" {
 		switch preferredShell {
@@ -671,17 +603,6 @@ func shouldSkipToolDirectory(path, searchRoot, name, goos string) bool {
 }
 
 // --- helpers ---
-
-func runCommand(ctx context.Context, cwd, name string, args []string, timeoutSec int) (string, error) {
-	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(timeoutCtx, name, args...)
-	cmd.Dir = cwd
-
-	output, err := cmd.CombinedOutput()
-	return truncateOutput(string(output)), err
-}
 
 func formatSize(size int64) string {
 	const unit = 1024

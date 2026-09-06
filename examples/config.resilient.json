@@ -1,0 +1,28 @@
+{
+  "host": "127.0.0.1",
+  "port": 7676,
+  "allowedRoots": [
+    "/path/to/disposable/workspace"
+  ],
+  "httpReadTimeout": "15s",
+  "httpWriteTimeout": "0s",
+  "httpIdleTimeout": "120s",
+  "tunnelHeartbeatInterval": "15s",
+  "tunnelReconnectBackoff": "1s",
+  "bashJobs": {
+    "maxConcurrent": 2,
+    "maxRetained": 64,
+    "outputBytes": 1048576,
+    "timeout": "1h",
+    "maxTimeout": "24h",
+    "retention": "30m"
+  },
+  "bashResourceLimit": {
+    "enabled": true,
+    "cpuPercent": 25,
+    "memoryMB": 1024,
+    "bandwidthBytesPerSecond": 0,
+    "nice": 10,
+    "systemdUser": true
+  }
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/snakex21/devspace-go/internal/process"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,9 @@ import (
 )
 
 func main() {
+	if process.RunWorkerIfRequested() {
+		return
+	}
 	// Parse CLI arguments
 	if len(os.Args) > 1 {
 		switch os.Args[1] {

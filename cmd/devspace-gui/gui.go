@@ -324,23 +324,11 @@ func saveGUIConfig(cfg *devconfig.Config) error {
 	}
 
 	configPath := filepath.Join(cfg.ConfigDir, "config.json")
-	configData := map[string]interface{}{
-		"host":          cfg.Host,
-		"port":          cfg.Port,
-		"allowedRoots":  cfg.AllowedRoots,
-		"publicBaseUrl": cfg.PublicBaseURL,
-		"stateDir":      devconfig.PortablePath(cfg.StateDir),
-		"worktreeRoot":  devconfig.PortablePath(cfg.WorktreeRoot),
-		"agentDir":      devconfig.PortablePath(cfg.AgentDir),
-		"toolMode":      cfg.ToolMode,
-		"toolNaming":    cfg.ToolNaming,
-		"shell":         cfg.Shell,
-		"lang":          cfg.Lang,
-		"widgets":       cfg.Widgets,
-		"skillsEnabled": cfg.SkillsEnabled,
-		"logLevel":      cfg.Logging.Level,
-		"logFormat":     cfg.Logging.Format,
-	}
+	configData := *cfg
+	configData.StateDir = devconfig.PortablePath(cfg.StateDir)
+	configData.WorktreeRoot = devconfig.PortablePath(cfg.WorktreeRoot)
+	configData.AgentDir = devconfig.PortablePath(cfg.AgentDir)
+	configData.ConfigDir = devconfig.PortablePath(cfg.ConfigDir)
 
 	data, err := json.MarshalIndent(configData, "", "  ")
 	if err != nil {

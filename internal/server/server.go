@@ -1,16 +1,17 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -28,14 +29,12 @@ import (
 // boolPtr returns a pointer to the given bool value (for ToolAnnotations pointer fields).
 func boolPtr(b bool) *bool { return &b }
 
-const (
-	Version                = "2.1.0"
-	cloudflaredURLTimeout  = 30 * time.Second
-	cloudflaredMaxAttempts = 2
-)
+const Version = "2.2.0"
 
 // Server represents the running Dev Space Go server.
 type Server struct {
+	jobsOnce   sync.Once
+	jobs       *tools.JobManager
 	cfg        *config.Config
 	httpServer *http.Server
 	tunnelStop context.CancelFunc
@@ -46,7 +45,9 @@ type Server struct {
 // New creates a new Dev Space Go server.
 func New(cfg *config.Config) (*Server, error) {
 	logger.Init(string(cfg.Logging.Level), string(cfg.Logging.Format))
-	tools.SetShell(cfg.Shell)
+	if err := cfg.ValidateRuntime(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 
 	s, err := store.New(cfg.StateDir)
 	if err != nil {
@@ -62,84 +63,80 @@ func New(cfg *config.Config) (*Server, error) {
 	}, nil
 }
 
-// Start begins listening for connections.
+// Start binds HTTP BEFORE starting a tunnel and owns all background lifetimes.
 func (s *Server) Start() error {
-	mux := http.NewServeMux()
-
-	// Health check
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"ok":true,"name":"devspace-go"}`)
-	})
-
-	// MCP endpoint using stateless Streamable HTTP. Workspace state is tracked
-	// separately by workspaceId, so transport sessions only add another failure
-	// mode when a proxy or web client drops an Mcp-Session-Id between requests.
-	handler := s.streamableMCPHandler()
-
-	mux.Handle("/mcp", handler)
-
-	// Legacy SSE endpoint for MCP clients that still expect /sse.
-	sseHandler := mcp.NewSSEHandler(
-		func(r *http.Request) *mcp.Server {
-			return s.createMcpServer()
-		},
-		&mcp.SSEOptions{DisableLocalhostProtection: true},
-	)
-	mux.Handle("/sse", sseHandler)
-
-	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port),
-		Handler: s.loggingMiddleware(mux),
-	}
-
-	// Auto-start Cloudflare Tunnel if available
-	s.startTunnel() // non-fatal
-
-	// Graceful shutdown
-	idleConnsClosed := make(chan struct{})
-	go func() {
-		sigint := make(chan os.Signal, 1)
-		signal.Notify(sigint, os.Interrupt, syscall.SIGTERM)
-		<-sigint
-
-		log.Info().Msg(locales.T("server.shutdown"))
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		if err := s.httpServer.Shutdown(ctx); err != nil {
-			log.Error().Err(err).Msg("server shutdown error")
-		}
-		if s.tunnelStop != nil {
-			s.tunnelStop()
-		}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	defer func() {
+		s.jobManager().Close()
 		if s.store != nil {
-			s.store.Close()
+			_ = s.store.Close()
 		}
-		close(idleConnsClosed)
 	}()
-
-	log.Info().
-		Str("host", s.cfg.Host).
-		Int("port", s.cfg.Port).
-		Msg(locales.T("server.listening"))
-
-	log.Info().
-		Strs("allowed_roots", s.cfg.AllowedRoots).
-		Msg(locales.T("server.roots"))
-
-	log.Info().
-		Bool("skills", s.cfg.SkillsEnabled).
-		Str("tool_mode", string(s.cfg.ToolMode)).
-		Str("tool_naming", string(s.cfg.ToolNaming)).
-		Msg(locales.T("server.config"))
-
-	if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+	s.httpServer = s.newHTTPServer(s.handler())
+	listener, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	tunnelCtx, cancelTunnel := context.WithCancel(ctx)
+	s.tunnelStop = cancelTunnel
+	tunnelDone := make(chan struct{})
+	go func() { defer close(tunnelDone); s.superviseTunnels(tunnelCtx) }()
+	defer func() { cancelTunnel(); <-tunnelDone }()
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+		log.Info().Msg(locales.T("server.shutdown"))
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Error().Err(err).Msg("server_shutdown_error")
+			_ = s.httpServer.Close()
+		}
+	}()
+	log.Info().Str("host", s.cfg.Host).Int("port", s.cfg.Port).Msg(locales.T("server.listening"))
+	err = s.httpServer.Serve(listener)
+	stop()
+	<-shutdownDone
+	if err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("server error: %w", err)
 	}
-
-	<-idleConnsClosed
 	return nil
+}
+
+func (s *Server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		fmt.Fprint(w, `{"ok":true,"name":"devspace-go"}`)
+	})
+	mux.Handle("/mcp", s.streamableMCPHandler())
+	mux.Handle("/sse", mcp.NewSSEHandler(func(r *http.Request) *mcp.Server {
+		return s.createMcpServer()
+	}, &mcp.SSEOptions{DisableLocalhostProtection: true}))
+	return s.loggingMiddleware(mux)
+}
+
+func (s *Server) newHTTPServer(handler http.Handler) *http.Server {
+	read := config.Duration(s.cfg.HTTPReadTimeout)
+	header := 10 * time.Second
+	if read > 0 {
+		header = min(header, read)
+	}
+	return &http.Server{
+		Addr: net.JoinHostPort(s.cfg.Host, fmt.Sprint(s.cfg.Port)), Handler: handler,
+		ReadTimeout: read, ReadHeaderTimeout: header,
+		WriteTimeout:   config.Duration(s.cfg.HTTPWriteTimeout),
+		IdleTimeout:    config.Duration(s.cfg.HTTPIdleTimeout),
+		MaxHeaderBytes: 1 << 20,
+	}
+}
+
+func (s *Server) jobManager() *tools.JobManager {
+	s.jobsOnce.Do(func() { s.jobs = tools.NewJobManager(s.cfg) })
+	return s.jobs
 }
 
 func (s *Server) streamableMCPHandler() http.Handler {
@@ -155,166 +152,11 @@ func (s *Server) streamableMCPHandler() http.Handler {
 	)
 }
 
-// startTunnel attempts to start a tunnel to expose the server publicly.
-// Tries cloudflared first, falls back to pinggy.
-// Returns the public URL if successful. Non-fatal.
-func (s *Server) startTunnel() string {
-	return s.startTunnelWithProviders(s.startCloudflared, s.startPinggy)
-}
-
-func (s *Server) startTunnelWithProviders(startCloudflared, startPinggy func() string) string {
-	for attempt := 0; attempt < cloudflaredMaxAttempts; attempt++ {
-		if url := startCloudflared(); url != "" {
-			return url
-		}
-	}
-
-	if url := startPinggy(); url != "" {
-		return url
-	}
-
-	fmt.Printf("⚠️  %s\n", locales.T("tunnel.cloudflared_timeout"))
-	return ""
-}
-
-// startPinggy creates a tunnel via pinggy.io using SSH.
-// Uses the same SSH key each time → same URL across restarts.
-func (s *Server) startPinggy() string {
-	sshPath, err := exec.LookPath("ssh")
-	if err != nil {
-		return "" // ssh not available
-	}
-
-	fmt.Println()
-	fmt.Printf("🔗  %s\n", locales.T("tunnel.starting_pinggy"))
-	fmt.Println()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	target := fmt.Sprintf("R0:localhost:%d", s.cfg.Port)
-	cmd := exec.CommandContext(ctx, sshPath,
-		"-p", "443",
-		"-o", "StrictHostKeyChecking=accept-new",
-		"-o", "ServerAliveInterval=30",
-		"-R", target,
-		"a.pinggy.io",
-	)
-
-	stdout, _ := cmd.StdoutPipe()
-	stderrPipe, _ := cmd.StderrPipe()
-
-	if err := cmd.Start(); err != nil {
-		fmt.Printf("⚠️  %s (pinggy): %v\n", locales.T("error.cmd_failed"), err)
-		cancel()
-		return ""
-	}
-
-	// Pinggy prints URL to stdout
-	urlRegex := regexp.MustCompile(`https://[a-zA-Z0-9]+\.(a\.)?pinggy\.(link|io|xyz)`)
-	done := make(chan string, 1)
-
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			fmt.Println(line)
-			if match := urlRegex.FindString(line); match != "" {
-				done <- match
-				return
-			}
-		}
-	}()
-
-	// Also check stderr
-	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if match := urlRegex.FindString(line); match != "" {
-				select {
-				case done <- match:
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	select {
-	case url := <-done:
-		s.tunnelStop = cancel
-		printTunnelURL(url)
-		return url
-	case <-time.After(15 * time.Second):
-		cancel()
-		return ""
-	}
-}
-
-// startCloudflared creates a tunnel via cloudflared.
-func (s *Server) startCloudflared() string {
-	tunnelExe := findCloudflaredExecutable()
-	if tunnelExe == "" {
-		return ""
-	}
-
-	fmt.Println()
-	fmt.Printf("🔗  %s\n", locales.T("tunnel.starting_cloudflared"))
-	fmt.Printf("    %s\n", tunnelExe)
-	fmt.Println()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, tunnelExe, "tunnel", "--url", fmt.Sprintf("http://%s:%d", s.cfg.Host, s.cfg.Port))
-
-	stdout, _ := cmd.StdoutPipe()
-	stderrPipe, _ := cmd.StderrPipe()
-
-	if err := cmd.Start(); err != nil {
-		fmt.Printf("⚠️  %s (cloudflared): %v\n", locales.T("error.cmd_failed"), err)
-		cancel()
-		return ""
-	}
-
-	urlRegex := regexp.MustCompile(`https://[a-zA-Z0-9-]+\.trycloudflare\.com`)
-	done := make(chan string, 1)
-
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			if match := urlRegex.FindString(scanner.Text()); match != "" {
-				done <- match
-				return
-			}
-		}
-	}()
-
-	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			line := scanner.Text()
-			fmt.Println(line)
-			if match := urlRegex.FindString(line); match != "" {
-				select {
-				case done <- match:
-				default:
-				}
-				return
-			}
-		}
-	}()
-
-	select {
-	case url := <-done:
-		s.tunnelStop = cancel
-		printTunnelURL(url)
-		return url
-	case <-time.After(cloudflaredURLTimeout):
-		cancel()
-		return ""
-	}
-}
-
 func findCloudflaredExecutable() string {
-	names := []string{"cloudflared.exe", "cloudflared"}
+	names := []string{"cloudflared"}
+	if runtime.GOOS == "windows" {
+		names = []string{"cloudflared.exe", "cloudflared"}
+	}
 	var dirs []string
 
 	if exePath, err := os.Executable(); err == nil {
@@ -340,7 +182,7 @@ func findCloudflaredExecutable() string {
 		seen[cleanDir] = true
 		for _, name := range names {
 			candidate := filepath.Join(cleanDir, name)
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && (runtime.GOOS == "windows" || info.Mode()&0111 != 0) {
 				return candidate
 			}
 		}
@@ -725,7 +567,7 @@ func (s *Server) registerTools(server *mcp.Server) {
 	mcp.AddTool(server,
 		&mcp.Tool{
 			Name:        names.Bash,
-			Description: bashDesc,
+			Description: bashDesc + " Returns a job_id immediately. Poll bash_status with job_id and next_offset until a terminal state and has_more=false; use bash_cancel to stop. Jobs survive HTTP disconnects, not server restarts.",
 			Annotations: &mcp.ToolAnnotations{
 				DestructiveHint: boolPtr(true),
 				OpenWorldHint:   boolPtr(true),
@@ -738,9 +580,40 @@ func (s *Server) registerTools(server *mcp.Server) {
 				result.SetError(err)
 				return result, tools.BashOutput{}, nil
 			}
-			return tools.RunBash(ctx, req, input, ws.Root)
+			if err := ctx.Err(); err != nil {
+				return tools.BashToolResult(tools.BashOutput{}, err)
+			}
+			input.WorkspaceID = ws.ID // Canonical ownership, not the aliases default/latest.
+			out, err := s.jobManager().Submit(input, ws.Root)
+			return tools.BashToolResult(out, err)
 		},
 	)
+	// Stable names also in legacy/minimal modes: jobs outlive transport sessions.
+	mcp.AddTool(server, &mcp.Tool{Name: "bash_status",
+		Description: "Poll incremental stdout/stderr of a shell job. Reuse next_offset as offset. Terminal states: completed, failed, cancelled, timed_out. Drain while has_more. dropped_bytes reports output lost to bounded retention.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}},
+		func(ctx context.Context, req *mcp.CallToolRequest, input tools.BashStatusInput) (*mcp.CallToolResult, tools.BashOutput, error) {
+			ws, err := s.registry.GetWorkspace(input.WorkspaceID)
+			if err != nil {
+				return tools.BashToolResult(tools.BashOutput{}, err)
+			}
+			input.WorkspaceID = ws.ID
+			out, err := s.jobManager().Status(input)
+			return tools.BashToolResult(out, err)
+		})
+	mcp.AddTool(server, &mcp.Tool{Name: "bash_cancel",
+		Description: "Cancel a shell job and its process tree. Poll bash_status for final state; cancellation may take several seconds.",
+		Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(true), IdempotentHint: true}},
+		func(ctx context.Context, req *mcp.CallToolRequest, input tools.BashCancelInput) (*mcp.CallToolResult, tools.BashOutput, error) {
+			ws, err := s.registry.GetWorkspace(input.WorkspaceID)
+			if err != nil {
+				return tools.BashToolResult(tools.BashOutput{}, err)
+			}
+			input.WorkspaceID = ws.ID
+			out, err := s.jobManager().Cancel(input)
+			return tools.BashToolResult(out, err)
+		})
+
 }
 
 // ToolNames holds the tool naming configuration.
@@ -796,7 +669,7 @@ func (s *Server) serverInstructions() string {
 	agentsMd := "Follow instructions returned by open_workspace. Before working under a path listed in availableAgentsFiles, use read to inspect that instruction file and follow it. "
 
 	return fmt.Sprintf(
-		"Use Dev Space Go as a local coding workspace. Call open_workspace once per project folder or worktree to obtain a workspaceId; if local absolute paths are blocked by the client, call open_default_workspace instead. Reuse that same workspaceId for all later file, search, edit, write, mkdir, move, and shell tools in that folder. If the workspaceId becomes stale after reconnecting, pass workspaceId 'default' or 'latest' to use the most recent/default workspace. %s%sPrefer %s for targeted modifications, %s only for new files or complete rewrites, %s for directory creation, %s for moves/renames, and %s for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create, move, rename, or modify files with %s. On Windows, %s uses PowerShell.exe; on Unix, bash.",
+		"Use Dev Space Go as a local coding workspace. Call open_workspace once per project folder or worktree to obtain a workspaceId; if local absolute paths are blocked by the client, call open_default_workspace instead. Reuse that same workspaceId for all later file, search, edit, write, mkdir, move, and shell tools in that folder. If the workspaceId becomes stale after reconnecting, pass workspaceId 'default' or 'latest' to use the most recent/default workspace. %s%sPrefer %s for targeted modifications, %s only for new files or complete rewrites, %s for directory creation, %s for moves/renames, and %s for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create, move, rename, or modify files with %s. On Windows, %s uses PowerShell.exe; on Unix, bash. Shell calls return a job_id immediately: poll bash_status with workspaceId, job_id and next_offset as offset. Never resubmit a command merely because it is still running. Use bash_cancel to stop it.",
 		agentsMd,
 		inspection,
 		names.Edit, names.Write, names.Mkdir, names.Move, names.Bash, names.Bash, names.Bash,

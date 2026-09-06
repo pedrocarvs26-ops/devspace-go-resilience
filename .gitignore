@@ -4,7 +4,6 @@
 /devspace
 /devspace-gui
 *.exe
-!tools/cloudflared.exe
 
 # Build output
 build/
@@ -27,3 +26,19 @@ auth.json
 # OS
 Thumbs.db
 .DS_Store
+
+# Release assets and local data (never source-control these)
+/release-assets/
+/dist/
+/tools/cloudflared
+/tools/cloudflared.exe
+.cloudflared/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+/config.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
